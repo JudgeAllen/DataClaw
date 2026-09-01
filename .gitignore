@@ -1,0 +1,18 @@
+# build output
+bin/
+obj/
+
+# downloaded market data (never publish)
+data/
+
+# runtime logs & local settings (may contain local paths / account info)
+*.log
+settings.json
+crash.log
+startup.log
+fetch.log
+
+# temp / OS
+*.tmp
+Thumbs.db
+Desktop.ini
