@@ -206,7 +206,19 @@ namespace TwsHistory.Core
             public decimal Size;
         }
 
+        /// <summary>A normalized historical bid/ask tick.</summary>
+        public struct TickPointBA
+        {
+            public long TimeBid;
+            public long TimeAsk;
+            public double PriceBid;
+            public double PriceAsk;
+            public decimal SizeBid;
+            public decimal SizeAsk;
+        }
+
         private List<TickPoint> pendingTicks;
+        private List<TickPointBA> pendingTicksBA;
         private int pendingTicksReqId = -1;
         private bool pendingTicksDone;
         private string lastTicksError;
@@ -222,6 +234,7 @@ namespace TwsHistory.Core
             {
                 pendingTicksReqId = reqId;
                 pendingTicks = new List<TickPoint>();
+                pendingTicksBA = new List<TickPointBA>();
                 pendingTicksDone = false;
                 lastTicksError = null;
             }
@@ -260,6 +273,28 @@ namespace TwsHistory.Core
             requestEvent.Set();
         }
 
+        public override void historicalTicksBidAsk(int reqId, HistoricalTickBidAsk[] ticks, bool done)
+        {
+            // whatToShow=BID_ASK responses arrive here
+            lock (gate)
+            {
+                if (reqId != pendingTicksReqId || pendingTicksBA == null) return;
+                if (ticks != null)
+                    foreach (var t in ticks)
+                        pendingTicksBA.Add(new TickPointBA
+                        {
+                            TimeBid = t.Time,
+                            TimeAsk = t.Time,
+                            PriceBid = t.PriceBid,
+                            PriceAsk = t.PriceAsk,
+                            SizeBid = t.SizeBid,
+                            SizeAsk = t.SizeAsk
+                        });
+                if (done) pendingTicksDone = true;
+            }
+            requestEvent.Set();
+        }
+
         /// <summary>
         /// Waits for the in-flight tick request to complete (done=true) or fail.
         /// Returns null on timeout/cancellation/connection failure.
@@ -281,6 +316,32 @@ namespace TwsHistory.Core
                     {
                         pendingTicks = null;
                         return null; // connection failed; LastErrorText carries the reason
+                    }
+                }
+                if (DateTime.UtcNow >= deadline) return null;
+                if (ct.IsCancellationRequested) return null;
+                requestEvent.WaitOne(200);
+            }
+        }
+
+        /// <summary>Bid/ask variant of WaitForTicksDone.</summary>
+        public List<TickPointBA> WaitForTicksDoneBA(TimeSpan timeout, CancellationToken ct)
+        {
+            DateTime deadline = DateTime.UtcNow + timeout;
+            while (true)
+            {
+                lock (gate)
+                {
+                    if (pendingTicksDone && pendingTicksBA != null)
+                    {
+                        var t = pendingTicksBA;
+                        pendingTicksBA = null;
+                        return t;
+                    }
+                    if (fatalConnectError != null)
+                    {
+                        pendingTicksBA = null;
+                        return null;
                     }
                 }
                 if (DateTime.UtcNow >= deadline) return null;

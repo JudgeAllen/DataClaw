@@ -33,6 +33,14 @@ namespace TwsHistory
             CliOptions opt;
             try
             {
+                // offline merge mode: BA + TRADES tick CSVs -> event stream / per-second series
+                if (args.Any(a => a == "--merge"))
+                {
+                    var mopt = MergeOptions.Parse(args);
+                    return MergeRunner.Run(mopt,
+                        msg => Console.WriteLine(msg),
+                        msg => Console.Error.WriteLine("[merge] " + msg));
+                }
                 opt = CliOptions.Parse(filtered.ToArray());
             }
             catch (ArgumentException ex)
@@ -77,14 +85,23 @@ namespace TwsHistory
             var fetcher = new TickFetcher(opt, info, error);
             var result = fetcher.Fetch();
 
+            bool isBa = string.Equals(opt.WhatToShow, "BID_ASK", StringComparison.OrdinalIgnoreCase);
+            int count = isBa ? result.BidAsks.Count : result.Ticks.Count;
+
             // Write whatever was collected even on partial failure/cancellation.
-            if (result.Ticks.Count > 0)
+            if (count > 0)
             {
                 string path = opt.Output ?? CsvExporter.DefaultTicksOutputName(opt);
-                CsvExporter.WriteTicks(path, result.Ticks);
+                if (isBa)
+                    CsvExporter.WriteTicksBA(path, result.BidAsks);
+                else
+                    CsvExporter.WriteTicks(path, result.Ticks);
                 Console.WriteLine();
-                Console.WriteLine($"Ticks:    {result.Ticks.Count:N0} ({result.Requests} requests)");
-                Console.WriteLine($"Range:    {result.Ticks[0].Time:yyyy-MM-dd HH:mm:ss}  ..  {result.Ticks[result.Ticks.Count - 1].Time:yyyy-MM-dd HH:mm:ss}");
+                Console.WriteLine($"Ticks:    {count:N0} ({result.Requests} requests)");
+                if (isBa)
+                    Console.WriteLine($"Range:    {result.BidAsks[0].Time:yyyy-MM-dd HH:mm:ss}  ..  {result.BidAsks[count - 1].Time:yyyy-MM-dd HH:mm:ss}");
+                else
+                    Console.WriteLine($"Range:    {result.Ticks[0].Time:yyyy-MM-dd HH:mm:ss}  ..  {result.Ticks[count - 1].Time:yyyy-MM-dd HH:mm:ss}");
                 Console.WriteLine($"Output:   {Path.GetFullPath(path)}");
             }
 
@@ -98,7 +115,7 @@ namespace TwsHistory
                 Console.WriteLine("Cancelled (partial data written).");
                 return 1;
             }
-            if (result.Ticks.Count == 0)
+            if (count == 0)
             {
                 Console.WriteLine("No ticks returned.");
                 return 0;

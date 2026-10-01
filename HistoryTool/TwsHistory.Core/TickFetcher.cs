@@ -15,25 +15,36 @@ namespace TwsHistory.Core
         public decimal Size;
     }
 
+    /// <summary>A single historical bid/ask tick.</summary>
+    public sealed class BidAskRecord
+    {
+        public DateTime Time; // the later of bid/ask time, in login-tz wall clock
+        public double PriceBid;
+        public double PriceAsk;
+        public decimal SizeBid;
+        public decimal SizeAsk;
+    }
+
     public sealed class TickResult
     {
         public bool Success => Error == null && !Cancelled;
         public bool Cancelled;
         public string Error;
         public List<TickRecord> Ticks = new List<TickRecord>();
+        public List<BidAskRecord> BidAsks = new List<BidAskRecord>();
         public int Requests;
     }
 
     /// <summary>
-    /// Fetches historical trade ticks via reqHistoricalTicks (max 1000 per request),
-    /// paginating backwards until the requested start time is reached or data ends.
-    /// NOTE: tick volume is huge - expect ~1000 ticks per request and heavy pacing
-    /// limits (60 requests / 10 min per client id), so only short ranges are practical.
+    /// Fetches historical ticks via reqHistoricalTicks (max 1000 per request),
+    /// paginating forward (the server returns the OLDEST ticks of the window).
+    /// whatToShow: TRADES/MIDPOINT -> trade ticks; BID_ASK -> bid/ask ticks.
+    /// NOTE: tick volume is huge - use short windows (hours to a couple of days).
     /// </summary>
     public sealed class TickFetcher
     {
         private const int ReqIdBase = 3001;
-        private const int MaxTicksPerRequest = 1000;
+        private int MaxTicksPerRequest => opt.MaxTicksPerRequest > 0 ? opt.MaxTicksPerRequest : 1000;
 
         private readonly CliOptions opt;
         private readonly Action<string> info;
@@ -87,10 +98,7 @@ namespace TwsHistory.Core
                 if (endEpoch <= startEpoch)
                     throw new ArgumentException("--end must be after --start");
 
-                // multiple trades can share the same second; dedupe on the full triple
-                var seen = new HashSet<(long, double, decimal)>();
-                var all = new List<(long time, double price, decimal size)>();
-                int seq = 0;
+                bool isBidAsk = string.Equals(opt.WhatToShow, "BID_ASK", StringComparison.OrdinalIgnoreCase);
 
                 info($"Tick fetch: {EpochToTicksString(startEpoch)} .. {EpochToTicksString(endEpoch)}, " +
                      $"up to {MaxTicksPerRequest} ticks/request (whatToShow={opt.WhatToShow}) - duration is ignored in ticks mode.");
@@ -99,7 +107,7 @@ namespace TwsHistory.Core
                 while (result.Requests < opt.MaxPages)
                 {
                     result.Requests++;
-                    int reqId = ReqIdBase + (seq++);
+                    int reqId = ReqIdBase + (result.Requests - 1);
                     string startStr = EpochToTicksString(startEpoch);
                     info($"Tick request {result.Requests}: {startStr} .. {EpochToTicksString(endEpoch)}");
 
@@ -107,63 +115,81 @@ namespace TwsHistory.Core
                     client.reqHistoricalTicks(reqId, contract, startStr, EpochToTicksString(endEpoch),
                         MaxTicksPerRequest, opt.WhatToShow, opt.UseRth, false, null);
 
-                    var ticks = wrapper.WaitForTicksDone(TimeSpan.FromSeconds(opt.RequestTimeoutSec), ct);
-                    if (ticks == null)
+                    if (isBidAsk)
                     {
-                        string tickErr = wrapper.LastTicksError;
-                        if (!string.IsNullOrEmpty(tickErr))
+                        var batch = wrapper.WaitForTicksDoneBA(TimeSpan.FromSeconds(opt.RequestTimeoutSec), ct);
+                        if (batch == null)
                         {
-                            error($"Tick request {result.Requests} failed ({tickErr}).");
-                            result.Error = tickErr;
+                            FailOrTimeout(result, result.Requests, wrapper);
+                            break;
                         }
-                        else
+                        if (ct.IsCancellationRequested) { result.Cancelled = true; break; }
+                        if (batch.Count == 0) { info("  no more ticks in the window."); break; }
+
+                        int added = 0;
+                        foreach (var t in batch)
+                            if (seenBA.Add((t.TimeBid, t.PriceBid, t.SizeBid, t.TimeAsk, t.PriceAsk, t.SizeAsk)))
+                            {
+                                allBA.Add(t);
+                                added++;
+                            }
+
+                        long lastTime = Math.Max(batch[batch.Count - 1].TimeBid, batch[batch.Count - 1].TimeAsk);
+                        info($"  {batch.Count} ticks ({added} new), first={UtcToWall(Math.Max(batch[0].TimeBid, batch[0].TimeAsk)):yyyy-MM-dd HH:mm:ss}, last={UtcToWall(lastTime):yyyy-MM-dd HH:mm:ss}");
+
+                        if (lastTime >= endEpoch) { info("  reached requested end."); break; }
+                        if (batch.Count < MaxTicksPerRequest) { info("  window fully covered."); break; }
+                        if (lastTime <= startEpoch) break; // safety: no forward progress
+                        startEpoch = lastTime;
+                    }
+                    else
+                    {
+                        var batch = wrapper.WaitForTicksDone(TimeSpan.FromSeconds(opt.RequestTimeoutSec), ct);
+                        if (batch == null)
                         {
-                            result.Error = $"Tick request {result.Requests} timed out or cancelled.";
+                            FailOrTimeout(result, result.Requests, wrapper);
+                            break;
                         }
-                        break;
-                    }
-                    if (ct.IsCancellationRequested)
-                    {
-                        result.Cancelled = true;
-                        break;
-                    }
-                    if (ticks.Count == 0)
-                    {
-                        info("  no more ticks in the window.");
-                        break;
-                    }
+                        if (ct.IsCancellationRequested) { result.Cancelled = true; break; }
+                        if (batch.Count == 0) { info("  no more ticks in the window."); break; }
 
-                    int added = 0;
-                    foreach (var t in ticks)
-                        if (seen.Add((t.Time, t.Price, t.Size)))
-                        {
-                            all.Add((t.Time, t.Price, t.Size));
-                            added++;
-                        }
+                        int added = 0;
+                        foreach (var t in batch)
+                            if (seenLast.Add((t.Time, t.Price, t.Size)))
+                            {
+                                allLast.Add((t.Time, t.Price, t.Size));
+                                added++;
+                            }
 
-                    info($"  {ticks.Count} ticks ({added} new), first={UtcToWall(ticks[0].Time):yyyy-MM-dd HH:mm:ss}, last={UtcToWall(ticks[ticks.Count - 1].Time):yyyy-MM-dd HH:mm:ss}");
+                        info($"  {batch.Count} ticks ({added} new), first={UtcToWall(batch[0].Time):yyyy-MM-dd HH:mm:ss}, last={UtcToWall(batch[batch.Count - 1].Time):yyyy-MM-dd HH:mm:ss}");
 
-                    if (ticks[ticks.Count - 1].Time >= endEpoch)
-                    {
-                        info("  reached requested end.");
-                        break;
+                        if (batch[batch.Count - 1].Time >= endEpoch) { info("  reached requested end."); break; }
+                        if (batch.Count < MaxTicksPerRequest) { info("  window fully covered."); break; }
+                        if (batch[batch.Count - 1].Time <= startEpoch) break; // safety: no forward progress
+                        startEpoch = batch[batch.Count - 1].Time;
                     }
-                    if (ticks.Count < MaxTicksPerRequest)
-                    {
-                        info("  window fully covered.");
-                        break;
-                    }
-
-                    long newStart = ticks[ticks.Count - 1].Time; // inclusive: re-fetch the boundary second, dedupe drops it
-                    if (newStart <= startEpoch) break; // safety: no forward progress
-                    startEpoch = newStart;
                 }
 
                 if (result.Requests >= opt.MaxPages)
                     info($"Reached --max-pages ({opt.MaxPages}); the result may be incomplete.");
 
-                foreach (var t in all.OrderBy(t => t.time))
-                    result.Ticks.Add(new TickRecord { Time = UtcToWall(t.time), Price = t.price, Size = t.size });
+                if (isBidAsk)
+                {
+                    foreach (var t in allBA.OrderBy(t => Math.Max(t.TimeBid, t.TimeAsk)))
+                        result.BidAsks.Add(new BidAskRecord
+                        {
+                            Time = UtcToWall(Math.Max(t.TimeBid, t.TimeAsk)),
+                            PriceBid = t.PriceBid,
+                            PriceAsk = t.PriceAsk,
+                            SizeBid = t.SizeBid,
+                            SizeAsk = t.SizeAsk
+                        });
+                }
+                else
+                {
+                    foreach (var t in allLast.OrderBy(t => t.time))
+                        result.Ticks.Add(new TickRecord { Time = UtcToWall(t.time), Price = t.price, Size = t.size });
+                }
                 return result;
             }
             catch (Exception ex)
@@ -171,6 +197,25 @@ namespace TwsHistory.Core
                 error("exception: " + ex);
                 result.Error = ex.Message;
                 return result;
+            }
+        }
+
+        private readonly HashSet<(long, double, decimal)> seenLast = new HashSet<(long, double, decimal)>();
+        private readonly List<(long time, double price, decimal size)> allLast = new List<(long time, double price, decimal size)>();
+        private readonly HashSet<(long, double, decimal, long, double, decimal)> seenBA = new HashSet<(long, double, decimal, long, double, decimal)>();
+        private readonly List<TwsWrapper.TickPointBA> allBA = new List<TwsWrapper.TickPointBA>();
+
+        private void FailOrTimeout(TickResult result, int reqNo, TwsWrapper wrapper)
+        {
+            string tickErr = wrapper.LastTicksError;
+            if (!string.IsNullOrEmpty(tickErr))
+            {
+                error($"Tick request {reqNo} failed ({tickErr}).");
+                result.Error = tickErr;
+            }
+            else
+            {
+                result.Error = $"Tick request {reqNo} timed out or cancelled.";
             }
         }
 
@@ -208,12 +253,6 @@ namespace TwsHistory.Core
         private static string EpochToTicksString(long epoch)
         {
             // server 223 accepts "yyyyMMdd HH:mm:ss UTC" (explicit timezone)
-            return DateTimeOffset.FromUnixTimeSeconds(epoch).UtcDateTime
-                .ToString("yyyyMMdd HH:mm:ss", CultureInfo.InvariantCulture) + " UTC";
-        }
-
-        private string EpochToUtcString(long epoch)
-        {
             return DateTimeOffset.FromUnixTimeSeconds(epoch).UtcDateTime
                 .ToString("yyyyMMdd HH:mm:ss", CultureInfo.InvariantCulture) + " UTC";
         }

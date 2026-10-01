@@ -56,6 +56,7 @@ namespace TwsHistory.Core
         public static string DefaultTicksOutputName(CliOptions opt)
         {
             string sym = string.IsNullOrWhiteSpace(opt.LocalSymbol) ? opt.Symbol : opt.LocalSymbol;
+            string kind = string.Equals(opt.WhatToShow, "BID_ASK", StringComparison.OrdinalIgnoreCase) ? "BA" : "";
             string start = "";
             string end = "";
             try
@@ -65,7 +66,7 @@ namespace TwsHistory.Core
             }
             catch { /* keep plain */ }
             string range = start.Length > 0 ? $"{start}_{end}" : "";
-            return range.Length > 0 ? $"{sym}_TICKS_{range}.csv" : $"{sym}_TICKS.csv";
+            return range.Length > 0 ? $"{sym}_TICKS{kind}_{range}.csv" : $"{sym}_TICKS{kind}.csv";
         }
 
         public static void WriteTicks(string path, List<TickRecord> ticks)
@@ -80,6 +81,26 @@ namespace TwsHistory.Core
                     w.Write(N(t.Price));
                     w.Write(',');
                     w.WriteLine(t.Size.ToString(CultureInfo.InvariantCulture));
+                }
+            }
+        }
+
+        public static void WriteTicksBA(string path, List<BidAskRecord> ticks)
+        {
+            using (var w = new StreamWriter(path, false, new UTF8Encoding(false)))
+            {
+                w.WriteLine("time,bid_price,bid_size,ask_price,ask_size");
+                foreach (var t in ticks)
+                {
+                    w.Write(t.Time.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture));
+                    w.Write(',');
+                    w.Write(N(t.PriceBid));
+                    w.Write(',');
+                    w.Write(t.SizeBid.ToString(CultureInfo.InvariantCulture));
+                    w.Write(',');
+                    w.Write(N(t.PriceAsk));
+                    w.Write(',');
+                    w.WriteLine(t.SizeAsk.ToString(CultureInfo.InvariantCulture));
                 }
             }
         }

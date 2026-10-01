@@ -42,6 +42,7 @@ namespace TwsHistory.Core
         public int RequestTimeoutSec = 120;
         public bool UseDelayed; // reqMarketDataType(3): accounts without real-time data need this
         public bool TicksMode;  // fetch historical ticks instead of bars
+        public int MaxTicksPerRequest = 1000; // reqHistoricalTicks numberOfTicks (IB docs: max 1000)
 
         public static CliOptions Parse(string[] args)
         {
@@ -111,6 +112,7 @@ namespace TwsHistory.Core
                     case "request-timeout": o.RequestTimeoutSec = ParseInt(kv.Key, kv.Value); break;
                     case "delayed":         o.UseDelayed = ParseBool(kv.Key, kv.Value); break;
                     case "ticks":           o.TicksMode = ParseBool(kv.Key, kv.Value); break;
+                    case "max-ticks":       o.MaxTicksPerRequest = ParseInt(kv.Key, kv.Value); break;
                     default:
                         throw new ArgumentException("Unknown option: --" + kv.Key);
                 }
